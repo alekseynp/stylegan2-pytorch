@@ -27,6 +27,10 @@ from distributed import (
     reduce_sum,
     get_world_size,
 )
+from processing.blur import RandomGaussianBlur
+from processing.random_do import RandomDo
+from processing.colour import BrightnessContrast
+from processing.mirror import Mirror
 
 
 def data_sampler(dataset, shuffle, distributed):
@@ -120,7 +124,7 @@ def set_grad_none(model, targets):
             p.grad = None
 
 
-def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
+def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, augs):
     loader = sample_data(loader)
 
     pbar = range(args.iter)
@@ -160,12 +164,14 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         real_img = next(loader)
         real_img = real_img.to(device)
+        real_img = augs(real_img)
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
         fake_img, _ = generator(noise)
+        fake_img = augs(fake_img)
         fake_pred = discriminator(fake_img)
 
         real_pred = discriminator(real_img)
@@ -198,6 +204,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
         fake_img, _ = generator(noise)
+        fake_img = augs(fake_img)
         fake_pred = discriminator(fake_img)
         g_loss = g_nonsaturating_loss(fake_pred)
 
@@ -277,13 +284,13 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     sample, _ = g_ema([sample_z])
                     utils.save_image(
                         sample,
-                        f'sample/{str(i).zfill(6)}.png',
+                        os.path.join(args.out_dir, f'sample/{str(i).zfill(6)}.png'),
                         nrow=int(args.n_sample ** 0.5),
                         normalize=True,
                         range=(-1, 1),
                     )
 
-            if i % 10000 == 0:
+            if i % 1000 == 0:
                 torch.save(
                     {
                         'g': g_module.state_dict(),
@@ -292,7 +299,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         'g_optim': g_optim.state_dict(),
                         'd_optim': d_optim.state_dict(),
                     },
-                    f'checkpoint/{str(i).zfill(6)}.pt',
+                    os.path.join(args.out_dir, f'checkpoint/{str(i).zfill(6)}.pt'),
                 )
 
 
@@ -317,6 +324,10 @@ if __name__ == '__main__':
     parser.add_argument('--channel_multiplier', type=int, default=2)
     parser.add_argument('--wandb', action='store_true')
     parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--n_mlp', type=int, default=8)
+    parser.add_argument('--latent', type=int, default=512)
+    parser.add_argument('--aug', action='store_true')
+    parser.add_argument('--out_dir', type=str, default='.')
 
     args = parser.parse_args()
 
@@ -327,9 +338,6 @@ if __name__ == '__main__':
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
         synchronize()
-
-    args.latent = 512
-    args.n_mlp = 8
 
     args.start_iter = 0
 
@@ -378,6 +386,16 @@ if __name__ == '__main__':
         g_optim.load_state_dict(ckpt['g_optim'])
         d_optim.load_state_dict(ckpt['d_optim'])
 
+    if args.aug:
+        rgb = RandomGaussianBlur(0.5, 3, 0.1, 3).to(device)
+        bc = BrightnessContrast(0.9, 1.11, -0.1, 0.1).to(device)
+        rbc = RandomDo(0.5, bc)
+        m = Mirror()
+        rm = RandomDo(0.5, m)
+        augs = torch.nn.Sequential(rgb, rbc, rm)
+    else:
+        augs = lambda x: x
+
     if args.distributed:
         generator = nn.parallel.DistributedDataParallel(
             generator,
@@ -413,4 +431,7 @@ if __name__ == '__main__':
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project='stylegan 2')
 
-    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
+    os.makedirs(os.path.join(args.out_dir, 'sample'), exist_ok=True)
+    os.makedirs(os.path.join(args.out_dir, 'checkpoint'), exist_ok=True)
+
+    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, augs)
